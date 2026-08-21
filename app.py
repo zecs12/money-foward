@@ -47,6 +47,51 @@ METRIC_LABELS = {
 }
 DIVERGING_METRICS = {"unrealized_gain", "unrealized_gain_pct"}
 
+TRANSACTION_TYPE_LABELS = {"income": "収入", "expense": "支出", "transfer": "振替"}
+
+TRANSACTION_COLUMN_LABELS = {
+    "date": "日付",
+    "description": "内容",
+    "amount": "金額",
+    "type": "収支",
+    "category": "大項目",
+    "sub_category": "中項目",
+    "account_name": "口座",
+}
+
+HOLDINGS_COLUMN_LABELS = {
+    "type": "種類",
+    "name": "銘柄名",
+    "code": "コード",
+    "institution": "取扱金融機関",
+    "quantity": "口数・株数",
+    "unit_price": "基準価額・単価",
+    "balance": "評価額",
+    "unrealized_gain": "評価損益",
+    "unrealized_gain_pct": "評価損益率(%)",
+}
+
+CARD_COLUMN_LABELS = {
+    "date": "日付",
+    "card_name": "カード名",
+    "description": "内容",
+    "amount": "金額",
+    "payment_type": "支払区分",
+    "family_member": "本人・家族区分",
+    "note": "備考",
+}
+
+
+def _item_label(df: pd.DataFrame) -> pd.Series:
+    """
+    種目(カテゴリ)の表示名を決める。
+    マネーフォワードMEの「中項目」は「大項目」より細かい分類で、明細の各行に
+    近い粒度のため、まとめすぎないようこちらを優先して使う
+    (中項目が空欄の行だけ、大項目を使う)。
+    """
+    sub = df["sub_category"].replace("", pd.NA)
+    return sub.fillna(df["category"]).fillna("(未分類)")
+
 
 def _diverging_cmap():
     return mcolors.LinearSegmentedColormap.from_list(
@@ -154,12 +199,15 @@ with tab_bank:
             st.plotly_chart(fig, width="stretch")
 
             st.subheader(f"{selected_year}年 種目別×月別 収支表")
-            target["category"] = target["category"].fillna("(未分類)")
+            st.caption("種目は、マネーフォワードMEの明細に表示される「中項目」の単位でまとめています")
+            target["item"] = _item_label(target)
             pivot = target.pivot_table(
-                index="category", columns="month_num", values="signed_amount", aggfunc="sum", fill_value=0
+                index="item", columns="month_num", values="signed_amount", aggfunc="sum", fill_value=0
             )
             pivot = pivot.reindex(columns=range(1, 13), fill_value=0)
             pivot.columns = MONTH_LABELS
+            pivot.index.name = "種目"
+            pivot.columns.name = None
             pivot["年間合計"] = pivot.sum(axis=1)
             pivot = pivot.sort_values("年間合計")
 
@@ -179,16 +227,18 @@ with tab_bank:
                     ].copy()
                     if y_tx.empty:
                         continue
-                    y_tx["category"] = y_tx["category"].fillna("(未分類)")
+                    y_tx["item"] = _item_label(y_tx)
                     y_tx["signed_amount"] = y_tx.apply(
                         lambda r: r["amount"] if r["type"] == "income" else -r["amount"], axis=1
                     )
                     y_pivot = y_tx.pivot_table(
-                        index="category", columns="month_num", values="signed_amount",
+                        index="item", columns="month_num", values="signed_amount",
                         aggfunc="sum", fill_value=0,
                     )
                     y_pivot = y_pivot.reindex(columns=range(1, 13), fill_value=0)
                     y_pivot.columns = MONTH_LABELS
+                    y_pivot.index.name = "種目"
+                    y_pivot.columns.name = None
                     st.markdown(f"**{y}年**")
                     st.dataframe(y_pivot.style.format("¥{:,.0f}"), width="stretch")
 
@@ -198,10 +248,15 @@ with tab_bank:
             if selected_month_label != "すべて":
                 month_num = MONTH_LABELS.index(selected_month_label) + 1
                 list_df = list_df[list_df["month_num"] == month_num]
+            display_df = list_df[
+                ["date", "description", "amount", "type", "category", "sub_category", "account_name"]
+            ].sort_values("date", ascending=False)
+            display_df["type"] = display_df["type"].map(TRANSACTION_TYPE_LABELS).fillna(display_df["type"])
+            display_df[["category", "sub_category", "account_name"]] = display_df[
+                ["category", "sub_category", "account_name"]
+            ].fillna("")
             st.dataframe(
-                list_df[
-                    ["date", "description", "amount", "type", "category", "sub_category", "account_name"]
-                ].sort_values("date", ascending=False),
+                display_df.rename(columns=TRANSACTION_COLUMN_LABELS),
                 width="stretch",
                 hide_index=True,
             )
@@ -262,6 +317,8 @@ with tab_nisa:
             metric_pivot = filtered.pivot_table(
                 index="name", columns="snapshot_date", values=selected_metric, aggfunc="last"
             )
+            metric_pivot.index.name = "銘柄名"
+            metric_pivot.columns.name = "取得日"
             if selected_metric in DIVERGING_METRICS:
                 max_abs = _safe_abs_max(metric_pivot)
                 styled_metric = metric_pivot.style.format("{:,.1f}", na_rep="-").background_gradient(
@@ -274,20 +331,23 @@ with tab_nisa:
             st.dataframe(styled_metric, width="stretch")
 
         st.subheader(f"銘柄別の内訳({latest_date}時点)")
+        holdings_display = latest[
+            [
+                "type",
+                "name",
+                "code",
+                "institution",
+                "quantity",
+                "unit_price",
+                "balance",
+                "unrealized_gain",
+                "unrealized_gain_pct",
+            ]
+        ].sort_values("balance", ascending=False)
+        holdings_display["code"] = holdings_display["code"].fillna("")
+        holdings_display["institution"] = holdings_display["institution"].fillna("")
         st.dataframe(
-            latest[
-                [
-                    "type",
-                    "name",
-                    "code",
-                    "institution",
-                    "quantity",
-                    "unit_price",
-                    "balance",
-                    "unrealized_gain",
-                    "unrealized_gain_pct",
-                ]
-            ].sort_values("balance", ascending=False),
+            holdings_display.rename(columns=HOLDINGS_COLUMN_LABELS),
             width="stretch",
             hide_index=True,
         )
@@ -333,10 +393,11 @@ with tab_saison:
         st.metric("この期間の利用金額合計", f"¥{list_df['amount'].sum():,.0f}")
 
         st.subheader("利用明細")
+        card_display = list_df[
+            ["date", "card_name", "description", "amount", "payment_type", "family_member", "note"]
+        ].sort_values("date", ascending=False)
         st.dataframe(
-            list_df[
-                ["date", "card_name", "description", "amount", "payment_type", "family_member", "note"]
-            ].sort_values("date", ascending=False),
+            card_display.rename(columns=CARD_COLUMN_LABELS),
             width="stretch",
             hide_index=True,
         )
