@@ -1,0 +1,14 @@
+# 認証情報
+.env
+
+# ログイン後に保存されるセッション情報・スクリーンショットなど
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
