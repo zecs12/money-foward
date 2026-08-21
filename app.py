@@ -293,10 +293,50 @@ with tab_nisa:
         )
 
 # ---------------------------------------------------------------------------
-# セゾンカード(準備中)
+# セゾンカード
 # ---------------------------------------------------------------------------
 with tab_saison:
-    st.info(
-        "セゾンカードのデータ取り込みは、まだ準備中です。CSVファイルの形式を確認できたら、"
-        "ここに利用明細の一覧(年月で検索可能)が表示されるようになります。"
-    )
+    card_tx = pd.read_sql_query("SELECT * FROM card_transactions", conn)
+
+    if card_tx.empty:
+        st.info(
+            "セゾンカードのデータがまだありません。セゾンカードの会員サイトからダウンロードした"
+            "CSVファイルを `data/saison_csv` フォルダに置いてから、ターミナルで "
+            "`python src/import_saison_csv.py` を実行してください。"
+        )
+    else:
+        card_tx["year_month"] = card_tx["date"].str[:7]
+
+        card_names = sorted(card_tx["card_name"].unique())
+        selected_card = st.selectbox("カードを選ぶ", ["すべて"] + card_names)
+        card_filtered = (
+            card_tx if selected_card == "すべて" else card_tx[card_tx["card_name"] == selected_card]
+        )
+
+        st.subheader("月別 利用金額の推移")
+        monthly = (
+            card_filtered.groupby("year_month")["amount"].sum().reset_index().sort_values("year_month")
+        )
+        fig = go.Figure()
+        fig.add_bar(x=monthly["year_month"], y=monthly["amount"], marker_color=CATEGORICAL_COLORS[1])
+        fig.update_layout(yaxis_title="利用金額(円)", xaxis_title="")
+        st.plotly_chart(fig, width="stretch")
+
+        months = sorted(card_filtered["year_month"].unique(), reverse=True)
+        selected_month = st.selectbox("年月で絞り込む", ["すべて"] + months)
+        list_df = (
+            card_filtered
+            if selected_month == "すべて"
+            else card_filtered[card_filtered["year_month"] == selected_month]
+        )
+
+        st.metric("この期間の利用金額合計", f"¥{list_df['amount'].sum():,.0f}")
+
+        st.subheader("利用明細")
+        st.dataframe(
+            list_df[
+                ["date", "card_name", "description", "amount", "payment_type", "family_member", "note"]
+            ].sort_values("date", ascending=False),
+            width="stretch",
+            hide_index=True,
+        )

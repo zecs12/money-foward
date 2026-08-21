@@ -47,8 +47,24 @@ CREATE TABLE IF NOT EXISTS holdings_snapshots (
     scraped_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS card_transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_name TEXT NOT NULL,
+    statement_payment_date TEXT NOT NULL,
+    date TEXT NOT NULL,
+    description TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    payment_type TEXT,
+    family_member TEXT,
+    note TEXT,
+    source_file TEXT,
+    imported_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_transactions_month ON transactions(month);
 CREATE INDEX IF NOT EXISTS idx_holdings_snapshot_date ON holdings_snapshots(snapshot_date);
+CREATE INDEX IF NOT EXISTS idx_card_transactions_date ON card_transactions(date);
+CREATE INDEX IF NOT EXISTS idx_card_transactions_payment_date ON card_transactions(statement_payment_date);
 """
 
 
@@ -114,6 +130,53 @@ def upsert_transactions(conn: sqlite3.Connection, transactions: list[dict]) -> i
     )
     conn.commit()
     return len(rows)
+
+
+def replace_card_transactions(
+    conn: sqlite3.Connection,
+    card_name: str,
+    statement_payment_date: str,
+    rows: list[dict],
+    source_file: str | None = None,
+) -> int:
+    """
+    セゾンカードの明細を保存する。同じカード・同じお支払日のデータが既にあれば、
+    いったん削除してから入れ直す(1枚のCSV=1回のご請求分、という単位のため、
+    同じCSVを読み込み直しても重複登録にならない)。
+    """
+    imported_at = _now_iso()
+    conn.execute(
+        "DELETE FROM card_transactions WHERE card_name = ? AND statement_payment_date = ?",
+        (card_name, statement_payment_date),
+    )
+
+    insert_rows = [
+        (
+            card_name,
+            statement_payment_date,
+            r["date"],
+            r["description"],
+            r["amount"],
+            r.get("payment_type"),
+            r.get("family_member"),
+            r.get("note"),
+            source_file,
+            imported_at,
+        )
+        for r in rows
+    ]
+
+    conn.executemany(
+        """
+        INSERT INTO card_transactions (
+            card_name, statement_payment_date, date, description, amount,
+            payment_type, family_member, note, source_file, imported_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        insert_rows,
+    )
+    conn.commit()
+    return len(insert_rows)
 
 
 def insert_holdings_snapshot(
