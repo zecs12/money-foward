@@ -56,17 +56,15 @@ METRIC_LABELS = {
 }
 DIVERGING_METRICS = {"unrealized_gain", "unrealized_gain_pct"}
 
-TRANSACTION_TYPE_LABELS = {"income": "収入", "expense": "支出", "transfer": "振替"}
-
 TRANSACTION_COLUMN_LABELS = {
     "date": "日付",
     "description": "内容",
     "amount": "金額",
-    "type": "収支",
     "major_category": "大項目",
     "minor_category": "中項目",
     "account_name": "口座",
 }
+TRANSACTION_COLUMN_ORDER = ["日付", "内容", "金額", "大項目", "中項目", "口座"]
 
 HOLDINGS_COLUMN_LABELS = {
     "type": "種類",
@@ -268,12 +266,7 @@ with tab_bank:
                     st.dataframe(y_pivot.style.format("¥{:,.0f}"), width="stretch")
 
             st.subheader("明細一覧")
-            st.caption(
-                "「大項目」「中項目」の欄は、この場で直接書き換えられます。変更すると、"
-                "その明細と同じ「内容」を持つルールが自動的に作られ(既にあれば更新され)、"
-                "同じ内容の他の明細にもすぐ反映されます。新しい項目名を直接入力することも、"
-                "「⚙️ カテゴリ設定」タブで登録済みの項目名をそのまま入力することもできます。"
-            )
+            st.caption("金額は、収入は青字、支出は赤字のマイナス表示にしています。")
             selected_month_label = st.selectbox("月で絞り込む", ["すべて"] + MONTH_LABELS)
             list_df = year_tx
             if selected_month_label != "すべて":
@@ -282,51 +275,30 @@ with tab_bank:
             display_df = list_df[
                 ["date", "description", "amount", "type", "major_category", "minor_category", "account_name"]
             ].sort_values("date", ascending=False).reset_index(drop=True)
-            display_df["type"] = display_df["type"].map(TRANSACTION_TYPE_LABELS).fillna(display_df["type"])
             display_df["minor_category"] = display_df["minor_category"].fillna("")
             display_df["account_name"] = display_df["account_name"].fillna("")
-
-            # 明細一覧の表(の編集内容)は、処理し終わったら消しておかないと、
-            # 次に画面を再描画したときに同じ変更をもう一度処理してしまう
-            # (ウィジェットを作った後にその値を書き換えることはできないため、
-            # 「次の描画で、表を作る前に消す」というやり方にしている)
-            editor_key = f"transaction_editor_{selected_year}_{selected_month_label}"
-            clear_target = st.session_state.pop("transaction_editor_should_clear", None)
-            if clear_target:
-                st.session_state.pop(clear_target, None)
-
-            st.data_editor(
-                display_df.rename(columns=TRANSACTION_COLUMN_LABELS),
-                width="stretch",
-                hide_index=True,
-                disabled=["日付", "内容", "金額", "収支", "口座"],
-                key=editor_key,
+            # 支出はマイナス表示にする(収入・振替はマネーフォワードの金額そのまま)
+            display_df["amount"] = display_df.apply(
+                lambda r: -r["amount"] if r["type"] == "expense" else r["amount"], axis=1
             )
 
-            editor_state = st.session_state.get(editor_key)
-            if editor_state and editor_state.get("edited_rows"):
-                applied = []
-                for row_pos, changes in editor_state["edited_rows"].items():
-                    if "大項目" not in changes and "中項目" not in changes:
-                        continue
-                    original_row = display_df.iloc[int(row_pos)]
-                    new_major = str(changes.get("大項目", original_row["major_category"]) or "").strip()
-                    new_minor = str(changes.get("中項目", original_row["minor_category"]) or "").strip()
-                    if not new_major:
-                        continue
-                    upsert_category_rule(
-                        conn,
-                        original_row["description"],
-                        new_major,
-                        new_minor or None,
-                        register_category=False,
-                    )
-                    applied.append((original_row["description"], new_major, new_minor))
-                if applied:
-                    st.session_state["transaction_editor_should_clear"] = editor_key
-                    names = "、".join(f"「{desc}」→{major}" for desc, major, _ in applied)
-                    st.success(f"カテゴリを更新しました: {names}")
-                    st.rerun()
+            def _color_amount(row: pd.Series) -> list[str]:
+                styles = [""] * len(row)
+                amount_idx = row.index.get_loc("金額")
+                if row["type"] == "income":
+                    styles[amount_idx] = f"color: {DIVERGING_POSITIVE}"
+                elif row["type"] == "expense":
+                    styles[amount_idx] = f"color: {DIVERGING_NEGATIVE}"
+                return styles
+
+            display_df = display_df.rename(columns=TRANSACTION_COLUMN_LABELS)
+            styled_display = display_df.style.apply(_color_amount, axis=1).format({"金額": "{:,.0f}"})
+            st.dataframe(
+                styled_display,
+                width="stretch",
+                hide_index=True,
+                column_order=TRANSACTION_COLUMN_ORDER,
+            )
 
             st.subheader("🏷️ カテゴリ分類ルールを管理する")
             st.caption(
