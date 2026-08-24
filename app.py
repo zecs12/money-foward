@@ -56,15 +56,8 @@ METRIC_LABELS = {
 }
 DIVERGING_METRICS = {"unrealized_gain", "unrealized_gain_pct"}
 
-TRANSACTION_COLUMN_LABELS = {
-    "date": "日付",
-    "description": "内容",
-    "amount": "金額",
-    "major_category": "大項目",
-    "minor_category": "中項目",
-    "account_name": "口座",
-}
-TRANSACTION_COLUMN_ORDER = ["日付", "内容", "金額", "大項目", "中項目", "口座"]
+TRANSACTION_ROW_COLUMN_WIDTHS = [1.1, 2.6, 1.2, 1.3, 1.3, 1.2]
+TRANSACTION_ROW_HEADERS = ["日付", "内容", "金額", "大項目", "中項目", ""]
 
 HOLDINGS_COLUMN_LABELS = {
     "type": "種類",
@@ -265,40 +258,102 @@ with tab_bank:
                     st.markdown(f"**{y}年**")
                     st.dataframe(y_pivot.style.format("¥{:,.0f}"), width="stretch")
 
+            @st.dialog("項目を設定")
+            def _open_category_dialog(description: str, current_major: str, current_minor: str) -> None:
+                st.write(f"**内容**: {description}")
+                if current_major and current_major != "未分類":
+                    detail = current_major + (f" / {current_minor}" if current_minor else "")
+                    st.caption(f"現在の分類: {detail}")
+
+                new_major_marker = "(新しく入力する)"
+                dialog_major_options = [new_major_marker] + _major_category_options()
+                default_major_idx = (
+                    dialog_major_options.index(current_major) if current_major in dialog_major_options else 0
+                )
+                dialog_major_choice = st.selectbox(
+                    "大項目", dialog_major_options, index=default_major_idx, key="dialog_major_choice"
+                )
+                if dialog_major_choice == new_major_marker:
+                    dialog_major_value = st.text_input("新しい大項目の名前", key="dialog_major_new")
+                else:
+                    dialog_major_value = dialog_major_choice
+
+                no_minor_marker = "(なし)"
+                new_minor_marker = "(新しく入力する)"
+                dialog_minor_candidates = (
+                    _minor_category_options(dialog_major_choice)
+                    if dialog_major_choice != new_major_marker
+                    else []
+                )
+                dialog_minor_options = [no_minor_marker, new_minor_marker] + dialog_minor_candidates
+                default_minor = current_minor if current_minor in dialog_minor_candidates else no_minor_marker
+                dialog_minor_choice = st.selectbox(
+                    "中項目",
+                    dialog_minor_options,
+                    index=dialog_minor_options.index(default_minor),
+                    key="dialog_minor_choice",
+                )
+                if dialog_minor_choice == new_minor_marker:
+                    dialog_minor_value = st.text_input("新しい中項目の名前", key="dialog_minor_new")
+                elif dialog_minor_choice == no_minor_marker:
+                    dialog_minor_value = ""
+                else:
+                    dialog_minor_value = dialog_minor_choice
+
+                st.caption("この設定は、同じ「内容」を持つ他の明細にも反映されます。")
+                if st.button("保存する", key="dialog_save_button"):
+                    if not dialog_major_value.strip():
+                        st.warning("大項目を入力してください。")
+                    else:
+                        upsert_category_rule(
+                            conn, description, dialog_major_value.strip(), dialog_minor_value.strip() or None
+                        )
+                        st.rerun()
+
             st.subheader("明細一覧")
-            st.caption("金額は、収入は青字、支出は赤字のマイナス表示にしています。")
+            st.caption(
+                "金額は、収入は青字、支出は赤字のマイナス表示にしています。"
+                "「項目を設定」ボタンから、その明細の大項目・中項目を設定できます。"
+            )
             selected_month_label = st.selectbox("月で絞り込む", ["すべて"] + MONTH_LABELS)
             list_df = year_tx
             if selected_month_label != "すべて":
                 month_num = MONTH_LABELS.index(selected_month_label) + 1
                 list_df = list_df[list_df["month_num"] == month_num]
-            display_df = list_df[
-                ["date", "description", "amount", "type", "major_category", "minor_category", "account_name"]
-            ].sort_values("date", ascending=False).reset_index(drop=True)
-            display_df["minor_category"] = display_df["minor_category"].fillna("")
-            display_df["account_name"] = display_df["account_name"].fillna("")
-            # 支出はマイナス表示にする(収入・振替はマネーフォワードの金額そのまま)
-            display_df["amount"] = display_df.apply(
-                lambda r: -r["amount"] if r["type"] == "expense" else r["amount"], axis=1
-            )
+            list_df = list_df.sort_values("date", ascending=False).reset_index(drop=True)
 
-            def _color_amount(row: pd.Series) -> list[str]:
-                styles = [""] * len(row)
-                amount_idx = row.index.get_loc("金額")
-                if row["type"] == "income":
-                    styles[amount_idx] = f"color: {DIVERGING_POSITIVE}"
-                elif row["type"] == "expense":
-                    styles[amount_idx] = f"color: {DIVERGING_NEGATIVE}"
-                return styles
+            if list_df.empty:
+                st.info("該当する明細がありません。")
+            else:
+                header_cols = st.columns(TRANSACTION_ROW_COLUMN_WIDTHS)
+                for col, label in zip(header_cols, TRANSACTION_ROW_HEADERS):
+                    col.markdown(f"**{label}**")
+                st.divider()
 
-            display_df = display_df.rename(columns=TRANSACTION_COLUMN_LABELS)
-            styled_display = display_df.style.apply(_color_amount, axis=1).format({"金額": "{:,.0f}"})
-            st.dataframe(
-                styled_display,
-                width="stretch",
-                hide_index=True,
-                column_order=TRANSACTION_COLUMN_ORDER,
-            )
+                for _, row in list_df.iterrows():
+                    row_cols = st.columns(TRANSACTION_ROW_COLUMN_WIDTHS)
+                    row_cols[0].write(row["date"])
+                    row_cols[1].write(row["description"])
+
+                    signed_amount = -row["amount"] if row["type"] == "expense" else row["amount"]
+                    if row["type"] == "income":
+                        amount_color = DIVERGING_POSITIVE
+                    elif row["type"] == "expense":
+                        amount_color = DIVERGING_NEGATIVE
+                    else:
+                        amount_color = "inherit"
+                    row_cols[2].markdown(
+                        f"<span style='color:{amount_color}'>{signed_amount:,.0f}</span>",
+                        unsafe_allow_html=True,
+                    )
+
+                    row_cols[3].write(row["major_category"])
+                    row_cols[4].write(row["minor_category"] or "")
+
+                    if row_cols[5].button("項目を設定", key=f"category_button_{row['mf_id']}"):
+                        _open_category_dialog(
+                            row["description"], row["major_category"], row["minor_category"] or ""
+                        )
 
             st.subheader("🏷️ カテゴリ分類ルールを管理する")
             st.caption(
