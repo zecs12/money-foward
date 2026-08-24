@@ -71,6 +71,14 @@ CREATE TABLE IF NOT EXISTS category_rules (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    major_category TEXT NOT NULL,
+    minor_category TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(major_category, minor_category)
+);
+
 CREATE INDEX IF NOT EXISTS idx_transactions_month ON transactions(month);
 CREATE INDEX IF NOT EXISTS idx_holdings_snapshot_date ON holdings_snapshots(snapshot_date);
 CREATE INDEX IF NOT EXISTS idx_card_transactions_date ON card_transactions(date);
@@ -231,6 +239,39 @@ def insert_holdings_snapshot(
     return len(rows)
 
 
+def upsert_category(conn: sqlite3.Connection, major_category: str, minor_category: str | None) -> None:
+    """
+    「大項目・中項目」の組み合わせを一覧に登録する。既に同じ組み合わせがあれば何もしない。
+    カテゴリ分類ルールを保存したときにも、自動的にここへ登録される
+    (ルールで新しく使った組み合わせが、次からは一覧から選べるようになる)。
+    """
+    major_category = major_category.strip()
+    minor_category = (minor_category or "").strip()
+    if not major_category:
+        return
+    created_at = _now_iso()
+
+    conn.execute(
+        """
+        INSERT INTO categories (major_category, minor_category, created_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(major_category, minor_category) DO NOTHING
+        """,
+        (major_category, minor_category, created_at),
+    )
+    conn.commit()
+
+
+def delete_category(conn: sqlite3.Connection, category_id: int) -> None:
+    """
+    一覧から「大項目・中項目」の組み合わせを削除する。
+    既にこの組み合わせが設定されている明細やルールには影響しない
+    (あくまで、これから選ぶときの候補一覧から消えるだけ)。
+    """
+    conn.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+    conn.commit()
+
+
 def upsert_category_rule(
     conn: sqlite3.Connection,
     keyword: str,
@@ -241,6 +282,7 @@ def upsert_category_rule(
     カテゴリ分類ルールを保存する。同じキーワードのルールが既にあれば、
     内容(大項目・中項目)を上書きし、更新日時も最新にする
     (優先順位は「一番最近登録・変更したルール」が勝つ仕組みのため)。
+    あわせて、使った大項目・中項目の組み合わせを一覧(categories)にも登録する。
     """
     keyword = keyword.strip()
     keyword_normalized = normalize_text(keyword)
@@ -259,6 +301,7 @@ def upsert_category_rule(
         (keyword, keyword_normalized, major_category, minor_category or None, updated_at),
     )
     conn.commit()
+    upsert_category(conn, major_category, minor_category)
 
 
 def delete_category_rule(conn: sqlite3.Connection, rule_id: int) -> None:

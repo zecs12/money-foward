@@ -27,7 +27,14 @@ import plotly.graph_objects as go  # noqa: E402
 import streamlit as st  # noqa: E402
 
 from categorize import apply_category_rules  # noqa: E402
-from db import DB_PATH, delete_category_rule, get_connection, upsert_category_rule  # noqa: E402
+from db import (  # noqa: E402
+    DB_PATH,
+    delete_category,
+    delete_category_rule,
+    get_connection,
+    upsert_category,
+    upsert_category_rule,
+)
 from viz_theme import (  # noqa: E402
     CATEGORICAL_COLORS,
     DIVERGING_NEGATIVE,
@@ -114,9 +121,26 @@ if not DB_PATH.exists():
 
 conn = get_connection()
 
-tab_bank, tab_nisa, tab_saison = st.tabs(
-    ["🏦 楽天銀行(家計簿)", "📈 楽天証券(NISA)", "💳 セゾンカード"]
+tab_bank, tab_nisa, tab_saison, tab_settings = st.tabs(
+    ["🏦 楽天銀行(家計簿)", "📈 楽天証券(NISA)", "💳 セゾンカード", "⚙️ カテゴリ設定"]
 )
+
+categories_df = pd.read_sql_query(
+    "SELECT * FROM categories ORDER BY major_category, minor_category", conn
+)
+
+
+def _major_category_options() -> list[str]:
+    if categories_df.empty:
+        return []
+    return sorted(categories_df["major_category"].unique().tolist())
+
+
+def _minor_category_options(major_category: str) -> list[str]:
+    if categories_df.empty:
+        return []
+    minors = categories_df.loc[categories_df["major_category"] == major_category, "minor_category"]
+    return sorted(m for m in minors.unique().tolist() if m)
 
 # ---------------------------------------------------------------------------
 # 楽天銀行(家計簿)
@@ -243,6 +267,12 @@ with tab_bank:
                     st.dataframe(y_pivot.style.format("¥{:,.0f}"), width="stretch")
 
             st.subheader("明細一覧")
+            st.caption(
+                "「大項目」「中項目」の欄は、この場で直接書き換えられます。変更すると、"
+                "その明細と同じ「内容」を持つルールが自動的に作られ(既にあれば更新され)、"
+                "同じ内容の他の明細にもすぐ反映されます。新しい項目名を直接入力することも、"
+                "「⚙️ カテゴリ設定」タブで登録済みの項目名をそのまま入力することもできます。"
+            )
             selected_month_label = st.selectbox("月で絞り込む", ["すべて"] + MONTH_LABELS)
             list_df = year_tx
             if selected_month_label != "すべて":
@@ -250,23 +280,44 @@ with tab_bank:
                 list_df = list_df[list_df["month_num"] == month_num]
             display_df = list_df[
                 ["date", "description", "amount", "type", "major_category", "minor_category", "account_name"]
-            ].sort_values("date", ascending=False)
+            ].sort_values("date", ascending=False).reset_index(drop=True)
             display_df["type"] = display_df["type"].map(TRANSACTION_TYPE_LABELS).fillna(display_df["type"])
-            display_df[["minor_category", "account_name"]] = display_df[
-                ["minor_category", "account_name"]
-            ].fillna("")
-            st.dataframe(
+            display_df["minor_category"] = display_df["minor_category"].fillna("")
+            display_df["account_name"] = display_df["account_name"].fillna("")
+
+            editor_key = f"transaction_editor_{selected_year}_{selected_month_label}"
+            st.data_editor(
                 display_df.rename(columns=TRANSACTION_COLUMN_LABELS),
                 width="stretch",
                 hide_index=True,
+                disabled=["日付", "内容", "金額", "収支", "口座"],
+                key=editor_key,
             )
+
+            editor_state = st.session_state.get(editor_key)
+            if editor_state and editor_state.get("edited_rows"):
+                applied = []
+                for row_pos, changes in editor_state["edited_rows"].items():
+                    if "大項目" not in changes and "中項目" not in changes:
+                        continue
+                    original_row = display_df.iloc[int(row_pos)]
+                    new_major = str(changes.get("大項目", original_row["major_category"]) or "").strip()
+                    new_minor = str(changes.get("中項目", original_row["minor_category"]) or "").strip()
+                    if not new_major:
+                        continue
+                    upsert_category_rule(conn, original_row["description"], new_major, new_minor or None)
+                    applied.append((original_row["description"], new_major, new_minor))
+                if applied:
+                    del st.session_state[editor_key]
+                    names = "、".join(f"「{desc}」→{major}" for desc, major, _ in applied)
+                    st.success(f"カテゴリを更新しました: {names}")
+                    st.rerun()
 
             st.subheader("🏷️ カテゴリ分類ルールを管理する")
             st.caption(
                 "明細の「内容」にキーワードが含まれていたら、大項目・中項目を自動で割り当てる"
-                "ルールです。同じ内容の明細1件だけに手動で設定したい場合も、下のフォームで"
-                "「内容」をそのままキーワードにしてルールを作れば反映されます。"
-                "複数のルールが一致する場合は、一番最近登録・変更したルールが優先されます。"
+                "ルールです。複数のルールが一致する場合は、一番最近登録・変更したルールが"
+                "優先されます。"
             )
 
             uncategorized_counts = (
@@ -276,26 +327,42 @@ with tab_bank:
             picked_description = st.selectbox(
                 "未分類の明細から選ぶ(件数が多いものから表示。選ばず自由入力もできます)",
                 keyword_options,
+                key="rule_picked_description",
+            )
+            default_keyword = "" if picked_description == "(自由入力する)" else picked_description
+            keyword_input = st.text_input(
+                "キーワード(明細の「内容」に含まれる文字列)",
+                value=default_keyword,
+                key="rule_keyword_input",
             )
 
-            with st.form("category_rule_form", clear_on_submit=True):
-                default_keyword = "" if picked_description == "(自由入力する)" else picked_description
-                keyword_input = st.text_input(
-                    "キーワード(明細の「内容」に含まれる文字列)", value=default_keyword
-                )
-                major_input = st.text_input("大項目")
-                minor_input = st.text_input("中項目(任意)")
-                submitted = st.form_submit_button("このルールを保存する")
+            new_major_marker = "(新しく入力する)"
+            major_options = [new_major_marker] + _major_category_options()
+            major_choice = st.selectbox("大項目", major_options, key="rule_major_choice")
+            if major_choice == new_major_marker:
+                major_value = st.text_input("新しい大項目の名前", key="rule_major_new")
+            else:
+                major_value = major_choice
 
-                if submitted:
-                    if not keyword_input.strip() or not major_input.strip():
-                        st.warning("キーワードと大項目は、両方とも入力してください。")
-                    else:
-                        upsert_category_rule(
-                            conn, keyword_input, major_input.strip(), minor_input.strip() or None
-                        )
-                        st.success(f"ルールを保存しました:「{keyword_input}」→ {major_input.strip()}")
-                        st.rerun()
+            no_minor_marker = "(なし)"
+            new_minor_marker = "(新しく入力する)"
+            minor_candidates = _minor_category_options(major_choice) if major_choice != new_major_marker else []
+            minor_options = [no_minor_marker, new_minor_marker] + minor_candidates
+            minor_choice = st.selectbox("中項目", minor_options, key="rule_minor_choice")
+            if minor_choice == new_minor_marker:
+                minor_value = st.text_input("新しい中項目の名前", key="rule_minor_new")
+            elif minor_choice == no_minor_marker:
+                minor_value = ""
+            else:
+                minor_value = minor_choice
+
+            if st.button("このルールを保存する", key="rule_save_button"):
+                if not keyword_input.strip() or not major_value.strip():
+                    st.warning("キーワードと大項目は、両方とも入力してください。")
+                else:
+                    upsert_category_rule(conn, keyword_input, major_value.strip(), minor_value.strip() or None)
+                    st.success(f"ルールを保存しました:「{keyword_input}」→ {major_value.strip()}")
+                    st.rerun()
 
             st.markdown("**登録済みのルール一覧**")
             if rules_df.empty:
@@ -464,3 +531,47 @@ with tab_saison:
             width="stretch",
             hide_index=True,
         )
+
+# ---------------------------------------------------------------------------
+# カテゴリ設定
+# ---------------------------------------------------------------------------
+with tab_settings:
+    st.subheader("大項目・中項目の一覧")
+    st.caption(
+        "ここであらかじめ登録しておくと、楽天銀行タブでカテゴリを設定するときに、"
+        "一覧から選べるようになります。ルールや明細一覧で新しい項目名を使った場合も、"
+        "自動的にここへ追加されます。"
+    )
+
+    new_major = st.text_input("大項目", key="settings_new_major")
+    new_minor = st.text_input("中項目(任意)", key="settings_new_minor")
+    if st.button("登録する", key="settings_add_button"):
+        if not new_major.strip():
+            st.warning("大項目を入力してください。")
+        else:
+            upsert_category(conn, new_major, new_minor)
+            st.success(f"「{new_major.strip()}」を登録しました。")
+            st.session_state["settings_new_major"] = ""
+            st.session_state["settings_new_minor"] = ""
+            st.rerun()
+
+    st.markdown("**登録済みの一覧**")
+    if categories_df.empty:
+        st.caption("まだ登録された項目がありません。")
+    else:
+        categories_display = categories_df[["major_category", "minor_category"]].rename(
+            columns={"major_category": "大項目", "minor_category": "中項目"}
+        )
+        st.dataframe(categories_display, width="stretch", hide_index=True)
+
+        delete_labels = [
+            f"{row.major_category} / {row.minor_category}" if row.minor_category else row.major_category
+            for row in categories_df.itertuples()
+        ]
+        col_del1, col_del2 = st.columns([3, 1])
+        delete_choice = col_del1.selectbox("削除する項目", delete_labels, key="settings_delete_choice")
+        if col_del2.button("削除する", key="settings_delete_button"):
+            category_id = int(categories_df.iloc[delete_labels.index(delete_choice)]["id"])
+            delete_category(conn, category_id)
+            st.success(f"「{delete_choice}」を削除しました。")
+            st.rerun()
