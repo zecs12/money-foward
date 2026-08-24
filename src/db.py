@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from config import DATA_DIR
+from text_match import normalize_text
 
 DB_PATH = DATA_DIR / "money.db"
 
@@ -61,10 +62,20 @@ CREATE TABLE IF NOT EXISTS card_transactions (
     imported_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS category_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    keyword TEXT NOT NULL UNIQUE,
+    keyword_normalized TEXT NOT NULL,
+    major_category TEXT NOT NULL,
+    minor_category TEXT,
+    updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_transactions_month ON transactions(month);
 CREATE INDEX IF NOT EXISTS idx_holdings_snapshot_date ON holdings_snapshots(snapshot_date);
 CREATE INDEX IF NOT EXISTS idx_card_transactions_date ON card_transactions(date);
 CREATE INDEX IF NOT EXISTS idx_card_transactions_payment_date ON card_transactions(statement_payment_date);
+CREATE INDEX IF NOT EXISTS idx_category_rules_updated_at ON category_rules(updated_at);
 """
 
 
@@ -218,3 +229,43 @@ def insert_holdings_snapshot(
     )
     conn.commit()
     return len(rows)
+
+
+def upsert_category_rule(
+    conn: sqlite3.Connection,
+    keyword: str,
+    major_category: str,
+    minor_category: str | None,
+) -> None:
+    """
+    カテゴリ分類ルールを保存する。同じキーワードのルールが既にあれば、
+    内容(大項目・中項目)を上書きし、更新日時も最新にする
+    (優先順位は「一番最近登録・変更したルール」が勝つ仕組みのため)。
+    """
+    keyword = keyword.strip()
+    keyword_normalized = normalize_text(keyword)
+    updated_at = _now_iso()
+
+    conn.execute(
+        """
+        INSERT INTO category_rules (keyword, keyword_normalized, major_category, minor_category, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(keyword) DO UPDATE SET
+            keyword_normalized=excluded.keyword_normalized,
+            major_category=excluded.major_category,
+            minor_category=excluded.minor_category,
+            updated_at=excluded.updated_at
+        """,
+        (keyword, keyword_normalized, major_category, minor_category or None, updated_at),
+    )
+    conn.commit()
+
+
+def delete_category_rule(conn: sqlite3.Connection, rule_id: int) -> None:
+    """
+    カテゴリ分類ルールを削除する。このルールで分類されていた明細は、
+    他に一致するルールが無ければ「未分類」に戻る
+    (明細に直接カテゴリを保存せず、その都度ルールと照らし合わせて決めているため)。
+    """
+    conn.execute("DELETE FROM category_rules WHERE id = ?", (rule_id,))
+    conn.commit()

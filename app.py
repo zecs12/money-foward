@@ -26,7 +26,8 @@ import plotly.express as px  # noqa: E402
 import plotly.graph_objects as go  # noqa: E402
 import streamlit as st  # noqa: E402
 
-from db import DB_PATH, get_connection  # noqa: E402
+from categorize import apply_category_rules  # noqa: E402
+from db import DB_PATH, delete_category_rule, get_connection, upsert_category_rule  # noqa: E402
 from viz_theme import (  # noqa: E402
     CATEGORICAL_COLORS,
     DIVERGING_NEGATIVE,
@@ -54,8 +55,8 @@ TRANSACTION_COLUMN_LABELS = {
     "description": "内容",
     "amount": "金額",
     "type": "収支",
-    "category": "大項目",
-    "sub_category": "中項目",
+    "major_category": "大項目",
+    "minor_category": "中項目",
     "account_name": "口座",
 }
 
@@ -80,17 +81,6 @@ CARD_COLUMN_LABELS = {
     "family_member": "本人・家族区分",
     "note": "備考",
 }
-
-
-def _item_label(df: pd.DataFrame) -> pd.Series:
-    """
-    種目(カテゴリ)の表示名を決める。
-    マネーフォワードMEの「中項目」は「大項目」より細かい分類で、明細の各行に
-    近い粒度のため、まとめすぎないようこちらを優先して使う
-    (中項目が空欄の行だけ、大項目を使う)。
-    """
-    sub = df["sub_category"].replace("", pd.NA)
-    return sub.fillna(df["category"]).fillna("(未分類)")
 
 
 def _diverging_cmap():
@@ -133,6 +123,7 @@ tab_bank, tab_nisa, tab_saison = st.tabs(
 # ---------------------------------------------------------------------------
 with tab_bank:
     tx = pd.read_sql_query("SELECT * FROM transactions", conn)
+    rules_df = pd.read_sql_query("SELECT * FROM category_rules", conn)
 
     if tx.empty:
         st.info(
@@ -142,6 +133,12 @@ with tab_bank:
     else:
         tx["year"] = tx["date"].str[:4]
         tx["month_num"] = tx["date"].str[5:7].astype(int)
+
+        # 大項目・中項目は、マネーフォワードME側の値ではなく、
+        # 下の「カテゴリ分類ルール」で自分で決めた内容を使う
+        categorized = apply_category_rules(tx["description"], rules_df)
+        tx["major_category"] = categorized["major_category"]
+        tx["minor_category"] = categorized["minor_category"]
 
         # 預金残高は参考として表示する(NISAの評価額とは合算しない)
         deposits = pd.read_sql_query(
@@ -199,8 +196,11 @@ with tab_bank:
             st.plotly_chart(fig, width="stretch")
 
             st.subheader(f"{selected_year}年 種目別×月別 収支表")
-            st.caption("種目は、マネーフォワードMEの明細に表示される「中項目」の単位でまとめています")
-            target["item"] = _item_label(target)
+            st.caption(
+                "種目(大項目)は、下の「カテゴリ分類ルール」でご自身で設定した内容です。"
+                "まだルールが無い明細は「未分類」になります。"
+            )
+            target["item"] = target["major_category"]
             pivot = target.pivot_table(
                 index="item", columns="month_num", values="signed_amount", aggfunc="sum", fill_value=0
             )
@@ -227,7 +227,7 @@ with tab_bank:
                     ].copy()
                     if y_tx.empty:
                         continue
-                    y_tx["item"] = _item_label(y_tx)
+                    y_tx["item"] = y_tx["major_category"]
                     y_tx["signed_amount"] = y_tx.apply(
                         lambda r: r["amount"] if r["type"] == "income" else -r["amount"], axis=1
                     )
@@ -249,17 +249,80 @@ with tab_bank:
                 month_num = MONTH_LABELS.index(selected_month_label) + 1
                 list_df = list_df[list_df["month_num"] == month_num]
             display_df = list_df[
-                ["date", "description", "amount", "type", "category", "sub_category", "account_name"]
+                ["date", "description", "amount", "type", "major_category", "minor_category", "account_name"]
             ].sort_values("date", ascending=False)
             display_df["type"] = display_df["type"].map(TRANSACTION_TYPE_LABELS).fillna(display_df["type"])
-            display_df[["category", "sub_category", "account_name"]] = display_df[
-                ["category", "sub_category", "account_name"]
+            display_df[["minor_category", "account_name"]] = display_df[
+                ["minor_category", "account_name"]
             ].fillna("")
             st.dataframe(
                 display_df.rename(columns=TRANSACTION_COLUMN_LABELS),
                 width="stretch",
                 hide_index=True,
             )
+
+            st.subheader("🏷️ カテゴリ分類ルールを管理する")
+            st.caption(
+                "明細の「内容」にキーワードが含まれていたら、大項目・中項目を自動で割り当てる"
+                "ルールです。同じ内容の明細1件だけに手動で設定したい場合も、下のフォームで"
+                "「内容」をそのままキーワードにしてルールを作れば反映されます。"
+                "複数のルールが一致する場合は、一番最近登録・変更したルールが優先されます。"
+            )
+
+            uncategorized_counts = (
+                tx.loc[tx["major_category"] == "未分類", "description"].value_counts().head(30)
+            )
+            keyword_options = ["(自由入力する)"] + uncategorized_counts.index.tolist()
+            picked_description = st.selectbox(
+                "未分類の明細から選ぶ(件数が多いものから表示。選ばず自由入力もできます)",
+                keyword_options,
+            )
+
+            with st.form("category_rule_form", clear_on_submit=True):
+                default_keyword = "" if picked_description == "(自由入力する)" else picked_description
+                keyword_input = st.text_input(
+                    "キーワード(明細の「内容」に含まれる文字列)", value=default_keyword
+                )
+                major_input = st.text_input("大項目")
+                minor_input = st.text_input("中項目(任意)")
+                submitted = st.form_submit_button("このルールを保存する")
+
+                if submitted:
+                    if not keyword_input.strip() or not major_input.strip():
+                        st.warning("キーワードと大項目は、両方とも入力してください。")
+                    else:
+                        upsert_category_rule(
+                            conn, keyword_input, major_input.strip(), minor_input.strip() or None
+                        )
+                        st.success(f"ルールを保存しました:「{keyword_input}」→ {major_input.strip()}")
+                        st.rerun()
+
+            st.markdown("**登録済みのルール一覧**")
+            if rules_df.empty:
+                st.caption("まだルールが登録されていません。")
+            else:
+                rules_sorted_df = rules_df.sort_values("updated_at", ascending=False)
+                rules_display = rules_sorted_df[
+                    ["keyword", "major_category", "minor_category", "updated_at"]
+                ].rename(
+                    columns={
+                        "keyword": "キーワード",
+                        "major_category": "大項目",
+                        "minor_category": "中項目",
+                        "updated_at": "更新日時",
+                    }
+                )
+                st.dataframe(rules_display, width="stretch", hide_index=True)
+
+                col_del1, col_del2 = st.columns([3, 1])
+                delete_keyword = col_del1.selectbox(
+                    "削除するルールのキーワード", rules_sorted_df["keyword"].tolist()
+                )
+                if col_del2.button("このルールを削除する"):
+                    rule_id = int(rules_sorted_df.loc[rules_sorted_df["keyword"] == delete_keyword, "id"].iloc[0])
+                    delete_category_rule(conn, rule_id)
+                    st.success(f"ルール「{delete_keyword}」を削除しました。")
+                    st.rerun()
 
 # ---------------------------------------------------------------------------
 # 楽天証券(NISA)
