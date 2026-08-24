@@ -89,7 +89,12 @@ CREATE INDEX IF NOT EXISTS idx_category_rules_updated_at ON category_rules(updat
 
 def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    # StreamlitのポップアップUI(st.dialog)は、内部的にボタン操作などを
+    # 元の画面とは別の処理の流れ(スレッド)で扱うことがある。SQLiteは既定では
+    # 「作成したときと同じ処理の流れでしか使えない」という制限があるため、
+    # ここでその制限を外している(このアプリは1人で使うローカル完結のツールで、
+    # 同時に複数箇所から書き込みが競合することはないため安全)。
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.executescript(_SCHEMA)
     return conn
 
