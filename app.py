@@ -285,7 +285,15 @@ with tab_bank:
             display_df["minor_category"] = display_df["minor_category"].fillna("")
             display_df["account_name"] = display_df["account_name"].fillna("")
 
+            # 明細一覧の表(の編集内容)は、処理し終わったら消しておかないと、
+            # 次に画面を再描画したときに同じ変更をもう一度処理してしまう
+            # (ウィジェットを作った後にその値を書き換えることはできないため、
+            # 「次の描画で、表を作る前に消す」というやり方にしている)
             editor_key = f"transaction_editor_{selected_year}_{selected_month_label}"
+            clear_target = st.session_state.pop("transaction_editor_should_clear", None)
+            if clear_target:
+                st.session_state.pop(clear_target, None)
+
             st.data_editor(
                 display_df.rename(columns=TRANSACTION_COLUMN_LABELS),
                 width="stretch",
@@ -308,7 +316,7 @@ with tab_bank:
                     upsert_category_rule(conn, original_row["description"], new_major, new_minor or None)
                     applied.append((original_row["description"], new_major, new_minor))
                 if applied:
-                    del st.session_state[editor_key]
+                    st.session_state["transaction_editor_should_clear"] = editor_key
                     names = "、".join(f"「{desc}」→{major}" for desc, major, _ in applied)
                     st.success(f"カテゴリを更新しました: {names}")
                     st.rerun()
@@ -543,6 +551,13 @@ with tab_settings:
         "自動的にここへ追加されます。"
     )
 
+    # 入力欄をクリアしたい場合、ウィジェットを作った後にその値を書き換えることは
+    # Streamlitの仕様上できないため、次の実行の「ウィジェットを作る前」に
+    # クリアする、というやり方にしている
+    if st.session_state.pop("settings_form_should_clear", False):
+        st.session_state["settings_new_major"] = ""
+        st.session_state["settings_new_minor"] = ""
+
     new_major = st.text_input("大項目", key="settings_new_major")
     new_minor = st.text_input("中項目(任意)", key="settings_new_minor")
     if st.button("登録する", key="settings_add_button"):
@@ -551,8 +566,7 @@ with tab_settings:
         else:
             upsert_category(conn, new_major, new_minor)
             st.success(f"「{new_major.strip()}」を登録しました。")
-            st.session_state["settings_new_major"] = ""
-            st.session_state["settings_new_minor"] = ""
+            st.session_state["settings_form_should_clear"] = True
             st.rerun()
 
     st.markdown("**登録済みの一覧**")
