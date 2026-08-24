@@ -272,17 +272,72 @@ def delete_category(conn: sqlite3.Connection, category_id: int) -> None:
     conn.commit()
 
 
+def update_category(
+    conn: sqlite3.Connection, category_id: int, major_category: str, minor_category: str | None
+) -> None:
+    """
+    登録済みの「大項目・中項目」の組み合わせを、新しい名前に書き換える。
+    この組み合わせを使っているルールがあれば、そちらも新しい名前に合わせて更新する。
+    """
+    major_category = major_category.strip()
+    minor_category = (minor_category or "").strip()
+    if not major_category:
+        return
+
+    row = conn.execute(
+        "SELECT major_category, minor_category FROM categories WHERE id = ?", (category_id,)
+    ).fetchone()
+    if row is None:
+        return
+    old_major, old_minor = row
+
+    try:
+        conn.execute(
+            "UPDATE categories SET major_category = ?, minor_category = ? WHERE id = ?",
+            (major_category, minor_category, category_id),
+        )
+    except sqlite3.IntegrityError:
+        # 変更後の組み合わせが既に別の行として登録済みだった場合は、
+        # 今の行を消して、既存の行のほうを使う(登録済み一覧が重複しないようにする)
+        conn.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+
+    updated_at = _now_iso()
+    if old_minor:
+        conn.execute(
+            """
+            UPDATE category_rules SET major_category = ?, minor_category = ?, updated_at = ?
+            WHERE major_category = ? AND minor_category = ?
+            """,
+            (major_category, minor_category or None, updated_at, old_major, old_minor),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE category_rules SET major_category = ?, minor_category = ?, updated_at = ?
+            WHERE major_category = ? AND (minor_category IS NULL OR minor_category = '')
+            """,
+            (major_category, minor_category or None, updated_at, old_major),
+        )
+    conn.commit()
+
+
 def upsert_category_rule(
     conn: sqlite3.Connection,
     keyword: str,
     major_category: str,
     minor_category: str | None,
+    register_category: bool = True,
 ) -> None:
     """
     カテゴリ分類ルールを保存する。同じキーワードのルールが既にあれば、
     内容(大項目・中項目)を上書きし、更新日時も最新にする
     (優先順位は「一番最近登録・変更したルール」が勝つ仕組みのため)。
-    あわせて、使った大項目・中項目の組み合わせを一覧(categories)にも登録する。
+
+    register_category=True の場合、使った大項目・中項目の組み合わせを
+    一覧(categories)にも登録する。明細一覧の表からの編集のように、
+    大項目・中項目が1つずつ別々に確定していく(=まだ組み合わせが
+    確定していない途中の状態を経由する)呼び出し元では、途中の組み合わせが
+    一覧に紛れ込まないよう、False を指定してもらう。
     """
     keyword = keyword.strip()
     keyword_normalized = normalize_text(keyword)
@@ -301,7 +356,8 @@ def upsert_category_rule(
         (keyword, keyword_normalized, major_category, minor_category or None, updated_at),
     )
     conn.commit()
-    upsert_category(conn, major_category, minor_category)
+    if register_category:
+        upsert_category(conn, major_category, minor_category)
 
 
 def delete_category_rule(conn: sqlite3.Connection, rule_id: int) -> None:

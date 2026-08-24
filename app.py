@@ -30,6 +30,7 @@ from categorize import apply_category_rules  # noqa: E402
 from db import (  # noqa: E402
     DB_PATH,
     delete_category,
+    update_category,
     delete_category_rule,
     get_connection,
     upsert_category,
@@ -313,7 +314,13 @@ with tab_bank:
                     new_minor = str(changes.get("中項目", original_row["minor_category"]) or "").strip()
                     if not new_major:
                         continue
-                    upsert_category_rule(conn, original_row["description"], new_major, new_minor or None)
+                    upsert_category_rule(
+                        conn,
+                        original_row["description"],
+                        new_major,
+                        new_minor or None,
+                        register_category=False,
+                    )
                     applied.append((original_row["description"], new_major, new_minor))
                 if applied:
                     st.session_state["transaction_editor_should_clear"] = editor_key
@@ -581,14 +588,35 @@ with tab_settings:
         )
         st.dataframe(categories_display, width="stretch", hide_index=True)
 
-        delete_labels = [
+        item_labels = [
             f"{row.major_category} / {row.minor_category}" if row.minor_category else row.major_category
             for row in categories_df.itertuples()
         ]
+
+        st.markdown("**登録済みの項目を編集する**")
+        edit_choice = st.selectbox("編集する項目", item_labels, key="settings_edit_choice")
+        edit_row = categories_df.iloc[item_labels.index(edit_choice)]
+        # 選ぶ項目が変わるたびに入力欄のキーも変えることで、
+        # 選び直したときに必ずその項目の内容が表示されるようにしている
+        edit_major = st.text_input(
+            "大項目", value=edit_row["major_category"], key=f"settings_edit_major__{edit_choice}"
+        )
+        edit_minor = st.text_input(
+            "中項目(任意)", value=edit_row["minor_category"], key=f"settings_edit_minor__{edit_choice}"
+        )
+        if st.button("この内容に更新する", key="settings_edit_button"):
+            if not edit_major.strip():
+                st.warning("大項目を入力してください。")
+            else:
+                update_category(conn, int(edit_row["id"]), edit_major, edit_minor)
+                st.success(f"「{edit_choice}」を更新しました。")
+                st.rerun()
+
+        st.markdown("**登録済みの項目を削除する**")
         col_del1, col_del2 = st.columns([3, 1])
-        delete_choice = col_del1.selectbox("削除する項目", delete_labels, key="settings_delete_choice")
+        delete_choice = col_del1.selectbox("削除する項目", item_labels, key="settings_delete_choice")
         if col_del2.button("削除する", key="settings_delete_button"):
-            category_id = int(categories_df.iloc[delete_labels.index(delete_choice)]["id"])
+            category_id = int(categories_df.iloc[item_labels.index(delete_choice)]["id"])
             delete_category(conn, category_id)
             st.success(f"「{delete_choice}」を削除しました。")
             st.rerun()
