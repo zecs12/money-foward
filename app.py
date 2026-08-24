@@ -338,10 +338,13 @@ with tab_bank:
                 key="rule_picked_description",
             )
             default_keyword = "" if picked_description == "(自由入力する)" else picked_description
+            # 選んだ明細が変わるたびに毎回別のキーにすることで、キーワード欄の内容を
+            # 選択に合わせて必ず更新する(同じキーのままだと、Streamlitの仕様上、
+            # 前回入力した内容が残ってしまい、選び直しても反映されない)
             keyword_input = st.text_input(
                 "キーワード(明細の「内容」に含まれる文字列)",
                 value=default_keyword,
-                key="rule_keyword_input",
+                key=f"rule_keyword_input__{picked_description}",
             )
 
             new_major_marker = "(新しく入力する)"
